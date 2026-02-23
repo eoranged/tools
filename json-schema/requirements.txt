@@ -1,0 +1,2 @@
+ijson>=3.0
+jsonschema>=4.0
