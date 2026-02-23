@@ -129,8 +129,15 @@ def _merge_objects(s1, s2):
         else:
             merged_props[key] = p1.get(key) or p2.get(key)
 
-    # A property is required only if required in both schemas
-    required = sorted(r1 & r2)
+    # When one side has no properties (e.g. the minimal seed schema),
+    # adopt the other side's required set — the empty side has no opinion.
+    # Otherwise, a field is required only if required in both schemas.
+    if not p1:
+        required = sorted(r2 & set(merged_props))
+    elif not p2:
+        required = sorted(r1 & set(merged_props))
+    else:
+        required = sorted(r1 & r2)
 
     result = {
         "type": "object",
