@@ -658,6 +658,142 @@ class TestComplexRealWorld:
         assert_schema_validates_all(schema, objects)
 
 
+class TestWrappedObject:
+    """JSON files where the array lives inside a wrapper object."""
+
+    def _write_wrapped(self, tmp_path, key, objects, filename="data.json"):
+        """Write objects as ``{key: [objects...]}`` and return the path."""
+        fp = tmp_path / filename
+        fp.write_text(json.dumps({key: objects}))
+        return str(fp)
+
+    def test_auto_detect_single_key(self, tmp_path):
+        """Auto-detect array inside {"objects": [...]}."""
+        objects = [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]
+        fp = self._write_wrapped(tmp_path, "objects", objects)
+        schema, _, seen, complete = generate_schema(fp)
+        assert complete
+        assert seen == 2
+        assert "id" in schema["properties"]
+        assert "name" in schema["properties"]
+        assert_schema_validates_all(schema, objects)
+
+    def test_explicit_path(self, tmp_path):
+        """Explicit --path bypasses auto-detection."""
+        objects = [{"x": 1}, {"x": 2, "y": "z"}]
+        fp = self._write_wrapped(tmp_path, "items", objects)
+        schema, _, seen, complete = generate_schema(fp, path="items")
+        assert complete
+        assert seen == 2
+        assert "x" in schema["properties"]
+        assert "y" in schema["properties"]
+        assert "x" in schema.get("required", [])
+        assert "y" not in schema.get("required", [])
+        assert_schema_validates_all(schema, objects)
+
+    def test_deep_path(self, tmp_path):
+        """Array nested several levels deep: {"response": {"data": {"items": [...]}}}."""
+        objects = [{"a": 1}, {"a": 2, "b": True}]
+        data = {"response": {"data": {"items": objects}}}
+        fp = tmp_path / "deep.json"
+        fp.write_text(json.dumps(data))
+        # auto-detect
+        schema, _, seen, complete = generate_schema(str(fp))
+        assert complete
+        assert seen == 2
+        assert_schema_validates_all(schema, objects)
+
+    def test_deep_path_explicit(self, tmp_path):
+        """Explicit dotted path for deeply nested array."""
+        objects = [{"v": "hello"}, {"v": "world", "n": 42}]
+        data = {"a": {"b": {"c": objects}}}
+        fp = tmp_path / "deep2.json"
+        fp.write_text(json.dumps(data))
+        schema, _, seen, complete = generate_schema(str(fp), path="a.b.c")
+        assert complete
+        assert seen == 2
+        assert_schema_validates_all(schema, objects)
+
+    def test_wrapped_with_optional_fields(self, tmp_path):
+        objects = [
+            {"id": 1, "name": "Alice"},
+            {"id": 2, "name": "Bob", "score": 95.5},
+            {"id": 3, "name": "Carol", "tags": ["x"]},
+        ]
+        fp = self._write_wrapped(tmp_path, "users", objects)
+        schema, _, seen, complete = generate_schema(fp)
+        assert complete
+        assert seen == 3
+        required = set(schema.get("required", []))
+        assert {"id", "name"} <= required
+        assert "score" not in required
+        assert "tags" not in required
+        assert_schema_validates_all(schema, objects)
+
+    def test_wrapped_large_array(self, tmp_path):
+        """Streaming works correctly for wrapped arrays with many items."""
+        objects = [{"id": i, "val": f"v{i}"} for i in range(500)]
+        fp = self._write_wrapped(tmp_path, "records", objects)
+        schema, iters, seen, complete = generate_schema(fp)
+        assert complete
+        assert seen == 500
+        assert iters == 1
+        assert_schema_validates_all(schema, objects[:10])
+        assert_schema_validates_all(schema, objects[-10:])
+
+    def test_wrapped_with_sibling_keys(self, tmp_path):
+        """Wrapper has sibling keys next to the array — only the array is streamed."""
+        objects = [{"k": 1}, {"k": 2}]
+        data = {"meta": "info", "count": 2, "results": objects}
+        fp = tmp_path / "siblings.json"
+        fp.write_text(json.dumps(data))
+        schema, _, seen, complete = generate_schema(str(fp), path="results")
+        assert complete
+        assert seen == 2
+        assert schema["properties"]["k"]["type"] == "integer"
+        assert_schema_validates_all(schema, objects)
+
+    def test_wrapped_continue_with_schema(self, tmp_path):
+        """Continuation (-s) works with wrapped files."""
+        objects = [{"a": 1}, {"b": "x"}, {"c": True}]
+        fp = self._write_wrapped(tmp_path, "data", objects)
+        schema1, _, _, complete1 = generate_schema(fp, max_iterations=1)
+        assert not complete1
+        schema2, _, _, complete2 = generate_schema(fp, schema=schema1)
+        assert complete2
+        assert_schema_validates_all(schema2, objects)
+
+    def test_wrapped_mixed_types(self, tmp_path):
+        """Wrapped array with objects containing mixed-type fields."""
+        objects = [
+            {"val": "hello"},
+            {"val": 42},
+            {"val": None},
+        ]
+        fp = self._write_wrapped(tmp_path, "items", objects)
+        schema, _, _, complete = generate_schema(fp)
+        assert complete
+        assert "anyOf" in schema["properties"]["val"]
+        assert_schema_validates_all(schema, objects)
+
+    def test_cli_with_path_flag(self, tmp_path):
+        """CLI -p flag works end-to-end."""
+        import subprocess
+        objects = [{"x": 1}, {"x": 2}]
+        data = {"rows": objects}
+        fp = tmp_path / "cli_path.json"
+        fp.write_text(json.dumps(data))
+        result = subprocess.run(
+            ["python3", "generate_schema.py", str(fp), "-p", "rows"],
+            capture_output=True, text=True,
+            cwd="/home/user/tools/json-schema",
+        )
+        assert result.returncode == 0
+        schema = json.loads(result.stdout)
+        assert schema["properties"]["x"]["type"] == "integer"
+        assert "Objects scanned: 2" in result.stderr
+
+
 class TestCLI:
     """Test the CLI via subprocess to verify end-to-end behavior."""
 

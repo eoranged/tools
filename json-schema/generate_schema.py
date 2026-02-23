@@ -10,6 +10,7 @@ Usage:
     python generate_schema.py data.json -o schema.json
     python generate_schema.py data.json -s existing_schema.json -o refined.json
     python generate_schema.py data.ndjson -f ndjson -n 500
+    python generate_schema.py wrapped.json -p objects     # {"objects": [...]}
 """
 
 import argparse
@@ -176,11 +177,18 @@ def validates(instance, schema):
 # Streaming readers
 # ---------------------------------------------------------------------------
 
-def stream_objects(filepath, fmt=None):
-    """Yield objects from a JSON file (JSON array or NDJSON).
+def stream_objects(filepath, fmt=None, path=None):
+    """Yield objects from a JSON file (JSON array, NDJSON, or nested array).
 
     *fmt* can be ``"array"``, ``"ndjson"``, or ``None`` (auto-detect).
+    *path* is a dotted key path to the array inside a JSON object
+    (e.g. ``"objects"`` for ``{"objects": [...]}``, or ``"data.items"``
+    for ``{"data": {"items": [...]}}``.  When given, the file is always
+    read as JSON (not NDJSON).
     """
+    if path is not None:
+        yield from _read_json_array(filepath, path)
+        return
     if fmt == "ndjson":
         yield from _read_ndjson(filepath)
         return
@@ -194,14 +202,51 @@ def stream_objects(filepath, fmt=None):
             ch = fh.read(1)
     if ch == b"[":
         yield from _read_json_array(filepath)
+    elif ch == b"{":
+        # Object wrapper — find the first array key automatically
+        detected = _detect_array_path(filepath)
+        if detected is not None:
+            yield from _read_json_array(filepath, detected)
+        else:
+            # Single object, no array found — yield it as one item
+            yield from _read_ndjson(filepath)
     else:
         yield from _read_ndjson(filepath)
 
 
-def _read_json_array(filepath):
+def _read_json_array(filepath, path=None):
+    """Stream items from a JSON array.
+
+    *path* is an optional dotted key path (e.g. ``"objects"`` or
+    ``"data.items"``).  The ijson prefix is built as ``"<path>.item"``
+    when a path is given, or just ``"item"`` for a top-level array.
+    """
+    prefix = f"{path}.item" if path else "item"
     with open(filepath, "rb") as fh:
-        for obj in ijson.items(fh, "item", use_float=True):
+        for obj in ijson.items(fh, prefix, use_float=True):
             yield obj
+
+
+def _detect_array_path(filepath):
+    """Return the dotted key path to the first array inside a JSON object.
+
+    Uses ijson's event-based parser so only the beginning of the file is
+    read — no need to load the whole thing.  Returns ``None`` if no array
+    is found (or if the file isn't valid single-document JSON, e.g. NDJSON).
+    """
+    try:
+        with open(filepath, "rb") as fh:
+            parser = ijson.parse(fh, use_float=True)
+            for prefix, event, _value in parser:
+                if event == "start_array" and prefix:
+                    return prefix
+                # Stop early if we hit a deeply nested value without an array
+                if prefix.count(".") > 10:
+                    break
+    except ijson.common.IncompleteJSONError:
+        # Not a single JSON document (e.g. NDJSON) — no array path to detect
+        pass
+    return None
 
 
 def _read_ndjson(filepath):
@@ -216,13 +261,15 @@ def _read_ndjson(filepath):
 # Core algorithm
 # ---------------------------------------------------------------------------
 
-def generate_schema(filepath, schema=None, max_iterations=1000, fmt=None):
+def generate_schema(filepath, schema=None, max_iterations=1000, fmt=None,
+                    path=None):
     """Generate or refine a JSON schema by streaming through *filepath*.
 
     Returns ``(schema, iterations, objects_seen, complete)``.
 
     *complete* is ``True`` when every object in the file matched the final
     schema; ``False`` when the iteration limit was hit first.
+    *path* is an optional dotted key to the array inside a wrapper object.
     """
     if schema is None:
         schema = minimal_schema()
@@ -230,7 +277,7 @@ def generate_schema(filepath, schema=None, max_iterations=1000, fmt=None):
     iterations = 0
     objects_seen = 0
 
-    for obj in stream_objects(filepath, fmt):
+    for obj in stream_objects(filepath, fmt, path=path):
         objects_seen += 1
         if not validates(obj, schema):
             schema = merge_schemas(schema, infer_schema(obj))
@@ -262,6 +309,13 @@ def main():
         help="Max number of schema updates (default: 1000)",
     )
     ap.add_argument(
+        "-p", "--path",
+        help='Dotted key path to the array inside a JSON object '
+             '(e.g. "objects" for {"objects": [...]}, '
+             '"data.items" for {"data": {"items": [...]}}). '
+             'Auto-detected when omitted.',
+    )
+    ap.add_argument(
         "-f", "--format",
         choices=["array", "ndjson", "auto"],
         default="auto",
@@ -288,6 +342,7 @@ def main():
         schema=existing,
         max_iterations=args.max_iterations,
         fmt=fmt,
+        path=args.path,
     )
 
     out = json.dumps(schema, indent=args.indent, sort_keys=False)
